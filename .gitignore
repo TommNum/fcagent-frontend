@@ -45,4 +45,7 @@ yarn-error.log*
 .env*.local
 
 # Turborepo
-.turbo 
+.turbo
+
+# Backend Reference Code
+fcagent-backend-reference/ 

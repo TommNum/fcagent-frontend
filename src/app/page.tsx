@@ -7,6 +7,7 @@ interface Message {
   sender: 'user' | 'agent';
   text: string;
   agentName?: string;
+  timestamp?: string; // Added for sorting
 }
 
 // Simple loading dots component inspired by the reference CSS
@@ -18,6 +19,19 @@ const LoadingDots = () => (
   </div>
 );
 
+// Temporary unique guest ID generator
+const getGuestUserId = () => {
+  if (typeof window !== 'undefined') {
+    let guestId = localStorage.getItem('fcGuestId');
+    if (!guestId) {
+      guestId = `guest_${crypto.randomUUID()}`;
+      localStorage.setItem('fcGuestId', guestId);
+    }
+    return guestId;
+  }
+  return 'guest_fallback'; // Fallback for SSR or non-browser env
+};
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
@@ -26,8 +40,10 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [isLinking, setIsLinking] = useState(false); // State for linking process
   const [linkStatus, setLinkStatus] = useState<string | null>(null); // State for linking feedback
+  const [guestUserId] = useState(getGuestUserId());
 
   const messagesEndRef = useRef<null | HTMLDivElement>(null);
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL;
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -44,52 +60,109 @@ export default function Home() {
         id: crypto.randomUUID(),
         sender: 'agent',
         text: 'Welcome to FireCrawl Support! How can I help you today?',
-        agentName: 'TriageAgent'
+        agentName: 'TriageAgent',
+        timestamp: new Date().toISOString(),
       }
     ]);
     setCurrentAgent('TriageAgent');
   }, []);
 
-  const handleSendMessage = async () => {
-    if (inputValue.trim() === '' || isLoading) return;
+  const fetchAgentReply = async (currentTicketId: string) => {
+    try {
+      // Wait a brief moment for the backend to process and respond
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Adjust delay as needed
 
+      const response = await fetch(`${API_BASE_URL}/requests/${currentTicketId}/messages?limit=50`); // Fetch last 50 messages
+      if (!response.ok) {
+        throw new Error(`Failed to fetch messages: ${response.status}`);
+      }
+      const fetchedMessages: any[] = await response.json();
+      
+      const newAgentMessages: Message[] = fetchedMessages
+        .filter(m => m.sender_type === 'agent' && !messages.some(existing => existing.id === m.id))
+        .map(m => ({
+          id: m.id,
+          sender: 'agent',
+          text: m.content,
+          agentName: "Agent", // Placeholder, need to get actual agent name if available in message or from request
+          timestamp: m.timestamp,
+        }));
+
+      if (newAgentMessages.length > 0) {
+        setMessages(prev => [...prev, ...newAgentMessages].sort((a, b) => new Date(a.timestamp!).getTime() - new Date(b.timestamp!).getTime()));
+      }
+
+      // Fetch request details to update agent name
+      const requestDetailsResponse = await fetch(`${API_BASE_URL}/requests/${currentTicketId}`);
+      if (requestDetailsResponse.ok) {
+        const requestDetails = await requestDetailsResponse.json();
+        if (requestDetails.assigned_agent) {
+            setCurrentAgent(requestDetails.assigned_agent);
+        }
+      }
+
+    } catch (error) {
+      console.error("Error fetching agent reply:", error);
+      // Optionally add an error message to the chat for the user
+    }
+  };
+
+  const handleSendMessage = async () => {
+    if (inputValue.trim() === '' || isLoading || !API_BASE_URL) return;
+
+    const userMessageText = inputValue.trim();
     const userMessage: Message = {
       id: crypto.randomUUID(),
       sender: 'user',
-      text: inputValue.trim(),
+      text: userMessageText,
+      timestamp: new Date().toISOString(),
     };
     setMessages((prevMessages) => [...prevMessages, userMessage]);
-    const currentInput = inputValue.trim();
     setInputValue('');
     setIsLoading(true);
-    setLinkStatus(null); // Clear link status on new message
+    setLinkStatus(null);
+
+    let currentTicketId = ticketId;
 
     try {
-      // TODO: Replace MOCKED RESPONSE with actual API call
-      // const response = await fetch(process.env.NEXT_PUBLIC_API_URL + '/api/chat', { ... });
-      // const data = await response.json();
+      if (!currentTicketId) {
+        // First message, create a new support request
+        const createRequestPayload = {
+          content: userMessageText,
+          source: "web_chat",
+          user_id: 0, // Using 0 as a placeholder for guest user_id as per model
+          metadata: { client_user_id: guestUserId } 
+        };
+        const response = await fetch(`${API_BASE_URL}/requests`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(createRequestPayload),
+        });
+        if (!response.ok) throw new Error(`API Error (create request): ${response.status}`);
+        const newRequest = await response.json();
+        currentTicketId = newRequest.id;
+        setTicketId(currentTicketId);
+        setCurrentAgent(newRequest.assigned_agent || 'TriageAgent'); // Update agent from new request
+         // Agent processing is background, so fetch reply after a delay
+        await fetchAgentReply(currentTicketId!);
 
-      // --- MOCKED RESPONSE ---
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      const data = {
-        reply: `Thanks for your message about: "${currentInput.substring(0, 30)}...". Our team is on it.`,
-        agentName: Math.random() > 0.5 ? 'APIImplementationAgent' : 'SDKIntegrationAgent',
-        newTicketId: ticketId || crypto.randomUUID().substring(0, 8).toUpperCase(),
-      };
-      // --- END MOCKED RESPONSE ---
-
-      const agentMessage: Message = {
-        id: crypto.randomUUID(),
-        sender: 'agent',
-        text: data.reply,
-        agentName: data.agentName,
-      };
-      setMessages((prevMessages) => [...prevMessages, agentMessage]);
-      if (data.agentName) {
-        setCurrentAgent(data.agentName);
-      }
-      if (data.newTicketId && !ticketId) {
-        setTicketId(data.newTicketId);
+      } else {
+        // Subsequent message, add to existing request
+        const createMessagePayload = {
+          request_id: currentTicketId,
+          sender_type: "user",
+          sender_id: guestUserId, 
+          content: userMessageText,
+          metadata: {}
+        };
+        const response = await fetch(`${API_BASE_URL}/requests/${currentTicketId}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(createMessagePayload),
+        });
+        if (!response.ok) throw new Error(`API Error (create message): ${response.status}`);
+        // Agent processing is background, so fetch reply after a delay
+        await fetchAgentReply(currentTicketId);
       }
 
     } catch (error) {
@@ -97,11 +170,12 @@ export default function Home() {
       const errorMessage: Message = {
         id: crypto.randomUUID(),
         sender: 'agent',
-        text: 'Sorry, an error occurred. Please try again later.',
+        text: 'Sorry, an error occurred while sending your message. Please try again.',
         agentName: 'System Error',
+        timestamp: new Date().toISOString(),
       };
       setMessages((prevMessages) => [...prevMessages, errorMessage]);
-       setCurrentAgent('System Error');
+      setCurrentAgent('System Error');
     } finally {
       setIsLoading(false);
     }
@@ -110,32 +184,33 @@ export default function Home() {
   // --- Linking Functionality (Mocked) ---
   const handleLinkTicket = async (type: 'email' | 'telegram') => {
     if (!ticketId || isLinking) return;
-
     setIsLinking(true);
     setLinkStatus(`Linking to ${type}...`);
-
-    // Prompt for identifier (basic implementation)
     const identifier = prompt(`Please enter your ${type} to link ticket ${ticketId}:`);
     if (!identifier) {
       setIsLinking(false);
       setLinkStatus(null);
       return;
     }
-
+    
+    // Backend modification needed here. For now, this is a mock.
+    console.warn("Backend Update Required: No direct API endpoint to update support request with email/telegram after creation through orchestrator.");
     try {
-      // TODO: Replace with actual API call to a backend endpoint like /api/link-ticket
+      // MOCK: Simulating an attempt and providing feedback
+      // In a real scenario, you might PUT to /requests/{ticketId} if backend model SupportRequestUpdate is extended
+      // or call a new dedicated endpoint like /requests/{ticketId}/link-contact
+      await new Promise(resolve => setTimeout(resolve, 1000)); 
+      // Example: Assume for now we can't actually link it via a direct orchestrator call shown so far.
+      // If we could, it would be an API call here.
+      setLinkStatus(`Mock: Linking ${type}: ${identifier} to ${ticketId}. (Backend endpoint TBD)`);
       console.log(`Mock API: Link ${ticketId} to ${type}: ${identifier}`);
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate network delay
-      // Assume success for mock
-      setLinkStatus(`${type.charAt(0).toUpperCase() + type.slice(1)} linked successfully!`);
-
+      // setLinkStatus(`${type.charAt(0).toUpperCase() + type.slice(1)} linked successfully!`); // If it were real
     } catch (error) {
       console.error(`Failed to link ${type}:`, error);
-      setLinkStatus(`Failed to link ${type}.`);
+      setLinkStatus(`Mock: Failed to link ${type}.`);
     } finally {
       setIsLinking(false);
-      // Optionally clear status message after a few seconds
-      setTimeout(() => setLinkStatus(null), 5000);
+      setTimeout(() => setLinkStatus(null), 7000); // Increased timeout for the mock status
     }
   }
   // --- End Linking Functionality ---
@@ -174,11 +249,12 @@ export default function Home() {
               </div>
             </div>
           ))}
-          {isLoading && (
+          {/* Combined isLoading and agent typing indicator */}
+          {isLoading && messages[messages.length -1]?.sender === 'user' && (
             <div className="flex justify-start">
                <div className="flex items-center space-x-2 max-w-xs md:max-w-md lg:max-w-lg px-3.5 py-2.5 rounded-xl shadow-sm bg-zinc-100 text-zinc-500 rounded-bl-none">
                   <LoadingDots />
-                  <span className="text-xs italic">{currentAgent || 'Agent'} is typing...</span>
+                  <span className="text-xs italic">{(currentAgent && currentAgent !== 'System Error' ) ? currentAgent : 'Agent'} is typing...</span>
               </div>
             </div>
           )}
@@ -204,7 +280,7 @@ export default function Home() {
               disabled={isLoading || inputValue.trim() === ''}
               className="px-6 py-3 bg-zinc-800 hover:bg-black disabled:bg-zinc-300 rounded-lg font-semibold text-white uppercase text-xs tracking-wider transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 focus:ring-offset-zinc-50 disabled:cursor-not-allowed flex items-center justify-center min-w-[90px] h-[48px] shadow-sm" // Fixed height
             >
-              {isLoading ? (
+              {isLoading && messages[messages.length -1]?.sender === 'user' ? (
                  <LoadingDots />
               ) : (
                 'Send'
@@ -236,7 +312,7 @@ export default function Home() {
             )}
           </div>
            {linkStatus && (
-              <p className={`mt-2 text-center text-xs animate-pulse ${linkStatus.includes('successfully') ? 'text-green-600' : 'text-red-600'}`}>{linkStatus}</p>
+              <p className={`mt-2 text-center text-xs animate-pulse ${linkStatus.includes('successfully') || linkStatus.includes('TBD') ? 'text-green-600' : 'text-red-600'}`}>{linkStatus}</p>
             )}
         </div>
       </div>
